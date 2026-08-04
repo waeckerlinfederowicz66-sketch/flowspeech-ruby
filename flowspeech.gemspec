@@ -23,5 +23,6 @@ Gem::Specification.new do |spec|
     Dir["lib/**/*.rb", "README.md", "LICENSE"]
   end
   spec.require_paths = ["lib"]
-end
 
+  spec.add_development_dependency "rake", ">= 12.3", "< 14"
+end
