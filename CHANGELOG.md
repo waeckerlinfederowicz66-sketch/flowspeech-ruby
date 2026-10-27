@@ -1,11 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 - 2026-10-27 (release candidate)
 
 - Suppress raw download transport causes so full_message does not reveal private result URLs; preserve recovery IDs.
 - Use generic API error messages and filter reflected key/URL values from error codes and traces, including terminal job errors.
 - Do not retry a known permanent HTTP error or redirect when its body is interrupted; audio downloads remain single-attempt operations.
-- Preserve received HTTP status, Retry-After and trace metadata when a response body is interrupted; retries keep the same UUID and bytes. Local fix only; existing published artifacts are unchanged.
+- Preserve received HTTP status, Retry-After and trace metadata when a response body is interrupted; retries keep the same UUID and bytes. Existing published artifacts are unchanged until a separate release.
 
 ## 0.2.0
 

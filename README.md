@@ -5,11 +5,19 @@ using only the standard library at runtime. Requires an active paid Basic, Pro
 or Scale subscription (not a trial) and a key from [API settings](https://flowspeech.io/settings/apikeys).
 
 ```ruby
-gem "flowspeech", "~> 0.2.0"
+gem "flowspeech", "~> 0.2.1"
 ```
 
 Set `FLOWSPEECH_API_KEY` through your environment or secret manager. Use this gem
 on your server, never in a public client. Generation consumes account credits.
+
+Version 0.2.1 is a prepared release candidate, not a publication claim.
+API and terminal-job errors use local messages and filter reflected keys and
+private URLs. Download errors suppress raw causes, including `full_message`
+cause chains, while preserving recovery IDs. Interrupted responses retain HTTP
+status and cooldown; permanent failures do not retry. Do not log raw request
+objects or result URLs. Injected transports and application logging remain
+trusted boundaries.
 
 ## Generate WAV Audio
 
