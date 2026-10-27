@@ -170,6 +170,15 @@ module FlowSpeech
 
     private
 
+    def error_token(value, fallback = nil)
+      value.is_a?(String) && value.match?(/\A[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\z/) && !value.include?(@api_key) ? value : fallback
+    end
+
+    def job_error(job)
+      code = job["error"].is_a?(Hash) ? job["error"]["code"] : nil
+      JobError.new(job.merge("error" => { "code" => error_token(code, "job_failed") }))
+    end
+
     def normalize_input(text, speakers, voice, segments, original)
       raise ArgumentError, "original_text is unsupported by v1" unless original.nil?
       unless segments.nil?
@@ -328,20 +337,20 @@ module FlowSpeech
         elsif job["status"] == "success" && job["resultDeleted"] != true
           return job
         else
-          raise JobError, job
+          raise job_error(job)
         end
       end
     end
 
     def download_bytes(job, deadline)
-      raise JobError, job unless job["status"] == "success" && job["resultDeleted"] != true
+      raise job_error(job) unless job["status"] == "success" && job["resultDeleted"] != true
       uri = safe_url(job.fetch("result").fetch("url"))
       req = Net::HTTP::Get.new(uri)
       response = exchange(uri, req, deadline, @max_download_bytes, @download_transport)
       raise Error, "Download HTTP #{response.code}; retry download with the same job" unless response.code.to_i == 200
       Wav.validate!(response.body.to_s) { remaining(deadline) }
     rescue IOError, SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError
-      raise Error, "Audio download failed; retry download with the same job"
+      raise Error, "Audio download failed; retry download with the same job", cause: nil
     end
 
     def request(method, path, body: nil, id: nil, deadline:)
@@ -349,6 +358,8 @@ module FlowSpeech
       attempts = 0
       loop do
         retry_after = nil
+        status = nil
+        trace_id = nil
         begin
           req = (method == :get ? Net::HTTP::Get : Net::HTTP::Post).new(uri)
           req["Authorization"] = "Bearer #{@api_key}"
@@ -358,7 +369,11 @@ module FlowSpeech
             req["Content-Type"] = "application/json"
             req.body = body
           end
-          response = exchange(uri, req, deadline, 1024 * 1024, @transport)
+          response = exchange(uri, req, deadline, 1024 * 1024, @transport) do |received|
+            status = received.code.to_i
+            retry_after = received["Retry-After"]
+            trace_id = error_token(received["X-Request-Id"])
+          end
           status = response.code.to_i
           retry_after = response["Retry-After"]
           data = begin
@@ -371,14 +386,17 @@ module FlowSpeech
             return [data, retry_after]
           end
           detail = data.is_a?(Hash) && data["error"].is_a?(Hash) ? data["error"] : {}
-          error = APIError.new(detail["message"] || "HTTP #{status}", status: status,
-            code: detail["code"], retryable: detail["retryable"] == true, retry_after: retry_after,
-            trace_id: data.is_a?(Hash) ? data["traceId"] || response["X-Request-Id"] : response["X-Request-Id"])
-          raise error unless status == 429 || (status >= 500 && error.retryable)
+          retryable = status == 429 || (status >= 500 && detail["retryable"] == true)
+          error = APIError.new("FlowSpeech API returned HTTP #{status}", status: status,
+            code: error_token(detail["code"], "api_error"), retryable: retryable, retry_after: retry_after,
+            trace_id: error_token(data.is_a?(Hash) ? data["traceId"] || response["X-Request-Id"] : response["X-Request-Id"]))
+          raise error unless error.retryable
         rescue IOError, SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError
-          error = Error.new("API transport failed")
+          retryable = status.nil? || (200..299).cover?(status) || status == 429 || (500..599).cover?(status)
+          error = APIError.new("API transport failed", status: status || 0,
+            error_code: "transport_error", retryable: retryable, retry_after: retry_after, trace_id: trace_id)
         end
-        raise error if attempts >= @max_retries
+        raise error if !error.retryable || attempts >= @max_retries
         attempts += 1
         pause(retry_after, deadline)
       end
@@ -395,6 +413,7 @@ module FlowSpeech
           http.max_retries = 0 if http.respond_to?(:max_retries=)
           result = nil
           http.request(request) do |res|
+            yield res if block_given?
             bytes = String.new(encoding: Encoding::BINARY)
             res.read_body do |chunk|
               remaining(deadline)
@@ -406,6 +425,7 @@ module FlowSpeech
           result
         end
       end
+      yield response if transport && block_given?
       remaining(deadline)
       raise Error, "Response exceeds byte limit" if response.body.to_s.bytesize > limit
       response

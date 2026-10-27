@@ -114,6 +114,69 @@ class ClientTest < Minitest::Test
     assert_equal "cancelled", c.cancel_job(ID)["status"]
   end
 
+  def with_interrupted_http(status, retry_after, recover:, stall: false)
+    server = TCPServer.new("127.0.0.1", 0)
+    captured = []
+    worker = Thread.new do
+      (recover ? 2 : 1).times do |index|
+        socket = server.accept
+        headers = []
+        while (line = socket.gets) && line != "\r\n"
+          headers << line
+        end
+        length = headers.join[/Content-Length: (\d+)/i, 1].to_i
+        captured << [headers.join[/Idempotency-Key: ([^\r]+)/i, 1], socket.read(length)]
+        if index.zero?
+          socket.write("HTTP/1.1 #{status} Unavailable\r\nRetry-After: #{retry_after}\r\nX-Request-Id: fixture-trace\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n{")
+          sleep 0.05 if stall
+        else
+          body = JSON.generate(job("queued"))
+          socket.write("HTTP/1.1 202 Accepted\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}")
+        end
+        socket.close
+      end
+    end
+    yield "http://127.0.0.1:#{server.addr[1]}", captured
+    assert worker.join(2), "mock server did not finish"
+  ensure
+    server.close if server
+    worker.kill if worker && worker.alive?
+    worker.join if worker
+  end
+
+  def test_interrupted_native_body_preserves_cooldown_uuid_and_bytes
+    [429, 503].each do |status|
+      ["30", (Time.now + 30).httpdate].each do |retry_after|
+        with_interrupted_http(status, retry_after, recover: true) do |base, captured|
+          delays = []
+          c = FlowSpeech::Client.new(api_key: "fixture-key", base_url: base, read_timeout: 1,
+            max_retries: 1, sleeper: ->(seconds) { delays << seconds })
+          assert_equal ID, c.create_job(text: "Hello", request_id: REQUEST_ID)["id"]
+          assert_equal 2, captured.length
+          assert_equal captured.first, captured.last
+          assert_equal REQUEST_ID, captured.first.first
+          assert_equal 1, delays.length
+          assert_operator delays.first, :>, 28
+          assert_operator delays.first, :<=, 30
+        end
+      end
+    end
+  end
+
+  def test_interrupted_native_body_retains_metadata_when_retries_exhausted
+    [429, 503].each do |status|
+      with_interrupted_http(status, "30", recover: false) do |base, _|
+        c = FlowSpeech::Client.new(api_key: "fixture-key", base_url: base, read_timeout: 1, max_retries: 0)
+        error = assert_raises(FlowSpeech::APIError) { c.create_job(text: "Hi", request_id: REQUEST_ID) }
+        assert_equal status, error.status
+        assert_equal "30", error.retry_after
+        assert_equal "fixture-trace", error.trace_id
+        assert_equal REQUEST_ID, error.request_id
+        assert error.retryable
+      end
+    end
+  end
+
   def test_error_metadata_and_retry_bound
     [401, 403, 409, 429, 503].each do |status|
       calls = 0
@@ -128,6 +191,87 @@ class ClientTest < Minitest::Test
       assert_equal REQUEST_ID, error.request_id
       assert_equal "9", error.retry_after
       assert_equal [429, 503].include?(status) ? 3 : 1, calls
+    end
+  end
+
+  def test_reflected_api_error_metadata_is_safe_to_log
+    ["fixture-key", "prefix-fixture-key-suffix", "https://audio.example.test/private?signature=CANARY"].each do |unsafe|
+      c = client { response(401, { error: { code: unsafe, message: unsafe, retryable: false }, traceId: unsafe }, "X-Request-Id" => unsafe) }
+      error = assert_raises(FlowSpeech::APIError) { c.create_job(text: "Hi", request_id: REQUEST_ID) }
+      refute_includes [error.to_s, error.inspect, error.code, error.trace_id].join(" "), unsafe
+      assert_equal "api_error", error.code
+      assert_nil error.trace_id
+      assert_nil error.cause
+      assert_equal REQUEST_ID, error.request_id
+    end
+  end
+
+  def test_reflected_terminal_error_is_safe_to_log
+    ["fixture-key", "prefix-fixture-key-suffix", "https://audio.example.test/private?signature=CANARY"].each do |unsafe|
+      c = client { flunk "No request expected" }
+      failed = job("failed").merge("error" => { "code" => unsafe, "message" => unsafe })
+      error = assert_raises(FlowSpeech::JobError) { c.wait_job(failed) }
+      refute_includes [error.to_s, error.inspect, error.error_code].join(" "), unsafe
+      assert_equal REQUEST_ID, error.request_id
+      assert_equal ID, error.job_id
+    end
+  end
+
+  def test_download_cause_chain_does_not_expose_private_url
+    private_url = "https://audio.example.test/private?signature=CANARY"
+    c = client(download_transport: ->(_, _) { raise IOError, "Failed URL: #{private_url}" }) { flunk "No API request expected" }
+    error = assert_raises(FlowSpeech::Error) { c.download(job) }
+    refute_includes [error.to_s, error.inspect, error.full_message].join(" "), private_url
+    assert_nil error.cause
+    assert_equal REQUEST_ID, error.request_id
+    assert_equal ID, error.job_id
+  end
+
+  def test_interrupted_permanent_api_failure_never_retries
+    [302, 400, 401, 403, 404, 409, 422].each do |status|
+      with_interrupted_http(status, "30", recover: false) do |base, captured|
+        delays = []
+        c = FlowSpeech::Client.new(api_key: "fixture-key", base_url: base, read_timeout: 1,
+          max_retries: 2, sleeper: ->(seconds) { delays << seconds })
+        error = assert_raises(FlowSpeech::APIError) { c.create_job(text: "Hi", request_id: REQUEST_ID) }
+        assert_equal status, error.status
+        assert_equal "30", error.retry_after
+        assert_equal REQUEST_ID, error.request_id
+        refute error.retryable
+        assert_empty delays
+        assert_equal 1, captured.length
+      end
+    end
+  end
+
+  def test_interrupted_auth_download_never_retries_or_calls_api
+    [401, 403].each do |status|
+      with_interrupted_http(status, "30", recover: false) do |base, captured|
+        c = FlowSpeech::Client.new(api_key: "fixture-key", read_timeout: 1, max_retries: 2,
+          transport: ->(_, _) { flunk "Download must not call API" }, sleeper: ->(_) { flunk "Download must not retry" })
+        audio_job = job
+        audio_job["result"]["url"] = "#{base}/audio"
+        error = assert_raises(FlowSpeech::Error) { c.download(audio_job) }
+        assert_equal ID, error.job_id
+        assert_equal REQUEST_ID, error.request_id
+        assert_equal 1, captured.length
+        assert_nil captured.first.first
+      end
+    end
+  end
+
+  def test_native_auth_body_timeout_never_retries
+    [401, 403].each do |status|
+      with_interrupted_http(status, "30", recover: false, stall: true) do |base, captured|
+        c = FlowSpeech::Client.new(api_key: "fixture-key", base_url: base, read_timeout: 0.01,
+          max_retries: 2, sleeper: ->(_) { flunk "Known auth error must not retry" })
+        error = assert_raises(FlowSpeech::APIError) { c.create_job(text: "Hi", request_id: REQUEST_ID) }
+        assert_equal status, error.status
+        assert_equal "30", error.retry_after
+        assert_equal REQUEST_ID, error.request_id
+        refute error.retryable
+        assert_equal 1, captured.length
+      end
     end
   end
 
