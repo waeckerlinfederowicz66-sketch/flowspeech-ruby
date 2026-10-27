@@ -11,7 +11,8 @@ gem "flowspeech", "~> 0.2.1"
 Set `FLOWSPEECH_API_KEY` through your environment or secret manager. Use this gem
 on your server, never in a public client. Generation consumes account credits.
 
-Version 0.2.1 is a prepared release candidate, not a publication claim.
+Version 0.2.1 includes the safety fixes below. Previously published 0.2.0
+artifacts remain unchanged.
 API and terminal-job errors use local messages and filter reflected keys and
 private URLs. Download errors suppress raw causes, including `full_message`
 cause chains, while preserving recovery IDs. Interrupted responses retain HTTP
